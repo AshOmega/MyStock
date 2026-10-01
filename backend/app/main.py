@@ -4,17 +4,22 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from .models import Buy, Contribution, ImportRequest, Stock
 from .screening import assess
+from .evidence import (
+    WorkbookConfirmation, ChartConfirmation, company_key, workbook_extract,
+    chart_extract, financial_assessment, chart_assessment,
+)
 
 
 DB_PATH = Path(os.environ.get("MYSTOCK_DB", str(Path(__file__).resolve().parents[2] / "data" / "mystock.sqlite3")))
@@ -39,7 +44,33 @@ def db():
                 symbol TEXT, quantity INTEGER, price_paise INTEGER,
                 cost_paise INTEGER NOT NULL DEFAULT 0, amount_paise INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS equities (
+                symbol TEXT PRIMARY KEY, company TEXT NOT NULL, company_key TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY, company TEXT NOT NULL,
+                company_key TEXT NOT NULL UNIQUE, symbol TEXT UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS evidence (
+                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, symbol TEXT,
+                company_id INTEGER REFERENCES companies(id),
+                filename TEXT NOT NULL, content BLOB NOT NULL, payload TEXT NOT NULL,
+                confirmation TEXT, imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                confirmed_at TEXT
+            );
         """)
+        if "company_id" not in {row["name"] for row in connection.execute("PRAGMA table_info(evidence)")}:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE evidence ADD COLUMN company_id INTEGER REFERENCES companies(id)")
+            connection.execute("""
+                INSERT INTO companies(company,company_key,symbol)
+                SELECT company,company_key,symbol FROM equities
+            """)
+            connection.execute("""
+                UPDATE evidence SET company_id=(SELECT id FROM companies WHERE companies.symbol=evidence.symbol)
+                WHERE symbol IS NOT NULL
+            """)
+            connection.commit()
         yield connection
         connection.commit()
     except Exception:
@@ -189,6 +220,9 @@ def import_csv(request: ImportRequest):
         connection.execute("BEGIN IMMEDIATE")
         current = latest(connection)
         for stock in records:
+            identity = connection.execute("SELECT company_key FROM companies WHERE symbol=?", (stock.symbol,)).fetchone()
+            if identity and identity["company_key"] != company_key(stock.name):
+                raise HTTPException(422, f"{stock.symbol}: company does not match confirmed workbook identity.")
             old = current.get(stock.symbol)
             if old and (stock.price_date < old.price_date or (
                 old.financial_period and stock.financial_period and stock.financial_period < old.financial_period
@@ -199,6 +233,170 @@ def import_csv(request: ImportRequest):
         connection.executemany("INSERT INTO snapshots(symbol,payload) VALUES (?,?)",
                                [(s.symbol, s.model_dump_json()) for s in records])
     return {"imported": len(records), "message": "All rows validated and saved atomically."}
+
+
+@app.post("/api/evidence/preview/{kind}")
+async def evidence_preview(kind: str, file: UploadFile = File(...)):
+    if kind not in ("workbook", "chart"):
+        raise HTTPException(422, "Evidence kind must be workbook or chart.")
+    content = await file.read(10_000_001)
+    await file.close()
+    if len(content) > 10_000_000:
+        raise HTTPException(422, "Evidence upload exceeds 10 MB.")
+    try:
+        payload = await run_in_threadpool(workbook_extract if kind == "workbook" else chart_extract, content)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    filename = Path(file.filename or "upload").name
+    with db() as connection:
+        suggested_company = None
+        if kind == "chart":
+            chart_company = payload["suggestions"].get("company")
+            if chart_company:
+                match = connection.execute("SELECT id FROM companies WHERE company_key=?",
+                                           (company_key(chart_company),)).fetchone()
+                suggested_company = match["id"] if match else None
+        cursor = connection.execute(
+            "INSERT INTO evidence(kind,filename,content,payload) VALUES (?,?,?,?)",
+            (kind, filename, content, json.dumps(payload, allow_nan=False)),
+        )
+        evidence_id = cursor.lastrowid
+    return {"id": evidence_id, "kind": kind, "filename": filename, "payload": payload,
+            "suggested_company_id": suggested_company}
+
+
+def draft(connection, evidence_id, kind):
+    row = connection.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
+    if not row or row["kind"] != kind:
+        raise HTTPException(404, "Evidence preview not found.")
+    if row["confirmed_at"]:
+        raise HTTPException(409, "Evidence is already confirmed; it cannot be reassigned.")
+    return row, json.loads(row["payload"])
+
+
+@app.get("/api/evidence/drafts")
+def evidence_drafts():
+    with db() as connection:
+        result = []
+        for kind in ("workbook", "chart"):
+            row = connection.execute("""
+                SELECT id,kind,filename,payload FROM evidence
+                WHERE id=(SELECT MAX(id) FROM evidence WHERE kind=?) AND confirmed_at IS NULL
+            """, (kind,)).fetchone()
+            if row:
+                payload = json.loads(row["payload"])
+                suggested_company = None
+                if kind == "chart" and payload["suggestions"].get("company"):
+                    match = connection.execute(
+                        "SELECT id FROM companies WHERE company_key=?",
+                        (company_key(payload["suggestions"]["company"]),),
+                    ).fetchone()
+                    suggested_company = match["id"] if match else None
+                result.append({"id": row["id"], "kind": kind, "filename": row["filename"],
+                               "payload": payload, "suggested_company_id": suggested_company})
+    return result
+
+
+@app.post("/api/evidence/{evidence_id}/workbook")
+def confirm_workbook(evidence_id: int, request: WorkbookConfirmation):
+    with db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _, payload = draft(connection, evidence_id, "workbook")
+        key = company_key(payload["company"])
+        existing = connection.execute("SELECT * FROM companies WHERE company_key=?", (key,)).fetchone()
+        alias = connection.execute("SELECT * FROM companies WHERE symbol=?", (request.symbol,)).fetchone() if request.symbol else None
+        csv_stock = latest(connection).get(request.symbol) if request.symbol else None
+        if ((alias and alias["company_key"] != key)
+                or (existing and existing["symbol"] and request.symbol and existing["symbol"] != request.symbol)
+                or (csv_stock and company_key(csv_stock.name) != key)):
+            raise HTTPException(422, "Symbol/company conflict: this workbook cannot be linked to that equity.")
+        if not existing:
+            cursor = connection.execute("INSERT INTO companies(company,company_key,symbol) VALUES (?,?,?)",
+                                        (payload["company"], key, request.symbol))
+            company_id = cursor.lastrowid
+        else:
+            company_id = existing["id"]
+            if request.symbol and existing["symbol"] is None:
+                connection.execute("UPDATE companies SET symbol=? WHERE id=?", (request.symbol, company_id))
+        identity = connection.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+        previous = connection.execute(
+            "SELECT payload,confirmation FROM evidence WHERE company_id=? AND kind='workbook' AND confirmed_at IS NOT NULL ORDER BY confirmed_at DESC,id DESC LIMIT 1",
+            (company_id,),
+        ).fetchone()
+        if previous:
+            old = json.loads(previous["payload"])
+            old_confirmation = json.loads(previous["confirmation"])
+            if old_confirmation["basis"] != request.basis or old_confirmation["company_type"] != request.company_type:
+                raise HTTPException(422, "Reporting basis/company type changed. Do not mix evidence definitions.")
+            if payload["annual"][-1]["period"] < old["annual"][-1]["period"] or (
+                old["quarterly"] and (not payload["quarterly"] or payload["quarterly"][-1]["period"] < old["quarterly"][-1]["period"])
+            ):
+                raise HTTPException(422, "Workbook would replace newer financial periods.")
+        connection.execute("UPDATE evidence SET company_id=?,symbol=?,confirmation=?,confirmed_at=? WHERE id=?",
+                           (company_id, identity["symbol"], request.model_dump_json(), datetime.now(timezone.utc).isoformat(), evidence_id))
+    return {"message": f"Workbook confirmed for {payload['company']}.", "company_id": company_id}
+
+
+@app.post("/api/evidence/{evidence_id}/chart")
+def confirm_chart(evidence_id: int, request: ChartConfirmation):
+    with db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        draft(connection, evidence_id, "chart")
+        equity = (connection.execute("SELECT * FROM companies WHERE id=?", (request.company_id,)).fetchone()
+                  if request.company_id is not None else
+                  connection.execute("SELECT * FROM companies WHERE symbol=?", (request.symbol,)).fetchone())
+        if not equity:
+            raise HTTPException(422, "Confirm a workbook for this company before linking its chart.")
+        if request.symbol and equity["symbol"] != request.symbol:
+            raise HTTPException(422, "Company and symbol selection conflict.")
+        if company_key(request.company) != equity["company_key"]:
+            raise HTTPException(422, "Chart company does not match the selected workbook company.")
+        previous = connection.execute(
+            "SELECT confirmation FROM evidence WHERE company_id=? AND kind='chart' AND confirmed_at IS NOT NULL ORDER BY confirmed_at DESC,id DESC LIMIT 1",
+            (equity["id"],),
+        ).fetchone()
+        if previous and request.captured_at < ChartConfirmation.model_validate_json(previous["confirmation"]).captured_at:
+            raise HTTPException(422, "Chart capture is older than the current confirmed chart.")
+        connection.execute("UPDATE evidence SET company_id=?,symbol=?,confirmation=?,confirmed_at=? WHERE id=?",
+                           (equity["id"], equity["symbol"], request.model_dump_json(), datetime.now(timezone.utc).isoformat(), evidence_id))
+    return {"message": f"Chart confirmed for {equity['company']}; no paper price or order eligibility changed.",
+            "company_id": equity["id"]}
+
+
+@app.get("/api/evidence")
+def get_evidence():
+    with db() as connection:
+        identities = connection.execute("SELECT * FROM companies ORDER BY company").fetchall()
+        result = []
+        for equity in identities:
+            item = {"id": equity["id"], "symbol": equity["symbol"], "company": equity["company"], "workbook": None, "chart": None,
+                    "entry_status": "not_established",
+                    "missing_evidence": ["Verified end-of-day price/date", "Actual publication dates", "Governance review",
+                                         "Promoter pledge evidence", "Average daily traded value", "Supported fair value"]}
+            for kind in ("workbook", "chart"):
+                row = connection.execute(
+                    "SELECT id,filename,payload,confirmation,confirmed_at FROM evidence WHERE company_id=? AND kind=? AND confirmed_at IS NOT NULL ORDER BY confirmed_at DESC,id DESC LIMIT 1",
+                    (equity["id"], kind),
+                ).fetchone()
+                if row:
+                    payload = json.loads(row["payload"])
+                    confirmation = json.loads(row["confirmation"])
+                    item[kind] = {"id": row["id"], "filename": row["filename"], "payload": payload,
+                                  "confirmation": confirmation, "confirmed_at": row["confirmed_at"],
+                                  "assessment": financial_assessment(payload, confirmation["company_type"]) if kind == "workbook" else chart_assessment(confirmation)}
+            result.append(item)
+    return result
+
+
+@app.get("/api/evidence/{evidence_id}/image")
+def evidence_image(evidence_id: int):
+    with db() as connection:
+        row = connection.execute("SELECT content FROM evidence WHERE id=? AND kind='chart'", (evidence_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Chart not found.")
+    content = row["content"]
+    return Response(content, media_type="image/png" if content.startswith(b"\x89PNG") else "image/jpeg",
+                    headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
 @app.get("/api/stocks")

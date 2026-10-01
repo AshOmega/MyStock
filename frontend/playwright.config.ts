@@ -10,6 +10,7 @@ export default defineConfig({
   use: {
     baseURL: 'http://127.0.0.1:5174',
     browserName: 'chromium',
+    actionTimeout: 15_000,
     launchOptions: process.env.MYSTOCK_TEST_BROWSER ? {
       executablePath: process.env.MYSTOCK_TEST_BROWSER,
     } : {},

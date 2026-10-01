@@ -29,7 +29,13 @@ Both processes must remain running. Stop each with Ctrl-C.
 API documentation is at <http://127.0.0.1:8000/docs>.
 Do not expose either server to a public network: authentication is not included.
 
-SQLite is created at `backend/data/mystock.sqlite3`; no real holdings are
+Screenshot OCR requires macOS with Xcode Command Line Tools (`swift`) and
+Apple Vision. If unavailable, install the tools with `xcode-select --install`.
+OCR runs locally; there is no cloud vision API. XLSX parsing uses openpyxl,
+image validation uses Pillow, and uploads use python-multipart, all installed
+from `backend/requirements.txt`. Restart the backend after updating the app.
+
+SQLite is created at `data/mystock.sqlite3` in the MyStock directory; no real holdings are
 preloaded. Set `MYSTOCK_DB` to an alternative path before starting the backend
 if needed. Stop the backend before copying the database for backup. Ledger
 events and imported snapshots persist across restarts. There is no deletion,
@@ -74,6 +80,77 @@ ones and sector reclassification requires review. The source's accuracy,
 accounting consistency and licensing remain the user's responsibility.
 
 ## Approved assessment rules
+
+### Excel and chart evidence workspace
+
+Open **Excel & charts**:
+
+1. Upload a Screener-format `.xlsx`. Preview the company name and sheet/period
+   coverage, then explicitly confirm its reporting basis, INR-crore units,
+   company type and source/identity. No symbol entry is required.
+2. Upload the corresponding PNG/JPEG chart. Inspect the image and raw local OCR
+   text, confirm the matching workbook company, and correct/confirm the company,
+   timeframe, capture timestamp with offset, displayed bar price/volume, SMAs
+   and whether the bar is complete. Missing indicators remain blank.
+3. Inspect that company's correlated fundamentals and chart evidence. Original
+   files, extraction payloads and confirmations persist in SQLite. Previews are
+   unassigned drafts until confirmed; confirmed records cannot be reassigned.
+
+Uploads are limited to 10 MB. Expanded XLSX content is limited to 20 MB and
+images to 20 million pixels. Macros and unsupported workbook layouts are
+rejected. The Screener `Data Sheet` labels are validated before values are read.
+Display sheets often contain formulas without cached values; the importer does
+not execute formulas or invent zero values. It calculates the six fundamental
+metrics from the raw annual series and shows source-cell references. Financial
+amounts are converted from crore to INR for the displayed cash-flow metric.
+EPS uses the template's adjusted shares, not verified diluted EPS. ROE uses
+closing equity, not average equity. Ratios requiring matched statements remain
+unknown if source period dates do not align.
+
+Annual and quarterly periods and ages are shown separately. Unlike the original
+CSV candidate gate below, the fundamentals workspace does not apply the blanket
+180-day blocker. Age disclosure is not an assertion that the latest required
+filings exist. No revised automatic buy eligibility has been approved.
+
+Charts are descriptive snapshot evidence, not reconstructed price histories.
+Only daily (`1D`) and weekly (`1W`) label confirmation is supported. A weekly
+20-period SMA is not a 20-day SMA. Bar volume is not average daily traded value.
+Capture time is not proof of the quote's observation time, bar end date or
+completion. OCR reads the top chart labels using Apple Vision; custom indicators,
+drawn trend lines, support/resistance and individual candle histories are not
+interpreted. Unreadable fields require manual transcription from visible
+labels, not guesses. Trend context reports price above/below the confirmed
+20/50/200 SMAs; it is not a model trained to predict returns.
+
+Identity linking rejects mismatched company names, inconsistent reporting
+bases/company types, and replacement of newer financial periods or chart
+captures with older ones. `Ltd`/`Limited`, case and punctuation differences are
+normalised; substantive name changes require review. A unique exact normalised
+OCR name match preselects the workbook company, but does not save the link until
+you confirm. With no match, select a company manually and check the OCR name.
+The company dropdown includes both confirmed companies and the name from the
+current workbook preview. A matching pending workbook is preselected and labelled
+**workbook confirmation pending**; finish **Confirm workbook company** before
+saving the chart link. Uploading one file no longer discards the other preview or
+its in-progress form entries. You can upload files in either order.
+Latest unfinished workbook/chart previews are recovered from SQLite when you
+reopen the workspace; confirmation fields must still be explicitly supplied.
+Filenames and fuzzy matching are not used, and OCR alone cannot create a company.
+
+Company records have stable internal IDs; names are displayed, not used as URL
+paths. Existing symbol-keyed Excel/chart evidence is migrated to company IDs
+without deleting files, confirmations or links. Previously recorded symbols
+remain as optional metadata; the compatibility API can still accept them.
+CSV/paper portfolios continue using symbols, and established symbol/name
+conflicts are rejected.
+
+Missing valuation, governance, pledges, publication dates and verified daily
+liquidity remain explicit. Excel/chart evidence does **not** overwrite CSV
+snapshots, become a paper-portfolio quote or unlock paper buys. The two
+assessments are separate: fundamentals can be available while entry suitability
+is not established. No buy instruction or loss-cap guarantee is generated.
+
+### Original CSV-based paper eligibility
 
 One point each: positive three-year revenue growth; positive three-year EPS
 growth; ROE >=15%; debt/equity <=1; positive operating cash flow; positive net
@@ -150,6 +227,12 @@ npm run test:e2e
 The tests start their own servers on ports 8001 and 5174 and shut them down
 afterward. Test imports are synthetic and do not touch the normal database.
 `MYSTOCK_API_URL` can override the frontend's proxy target for these checks.
+
+To also exercise the supplied real-sample Excel/chart confirmation workflow,
+set `MYSTOCK_SAMPLE_DIR=/Users/karollil/AppTrial` in the browser-test command.
+That test expects `TCS.xlsx` and `TCS_chart.png` there and uses their existing
+labels; it does not copy samples into the repository. Without that variable,
+the optional sample test is explicitly skipped. Always use a fresh test DB.
 
 ## Privacy and next-stage boundaries
 

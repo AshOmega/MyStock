@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
+import EvidenceWorkspace from './Evidence'
 
 type Assessment = {
   status: 'research_candidate' | 'watchlist' | 'insufficient_data' | 'unsupported_sector'
@@ -79,7 +80,7 @@ function App() {
     <aside>
       <div className="brand"><span className="brand-icon">M</span>MyStock<span className="version">LOCAL / 01</span></div>
       <p className="aside-caption">Research before returns.</p>
-      <nav aria-label="Main navigation">{['Research', 'Paper portfolio', 'Import data', 'Methodology'].map(item =>
+      <nav aria-label="Main navigation">{['Research', 'Excel & charts', 'Paper portfolio', 'Import data', 'Methodology'].map(item =>
         <button key={item} className={active === item ? 'nav-active' : ''} onClick={() => setActive(item)}>{item}</button>)}</nav>
       <div className="profile"><span className="eyebrow">YOUR INVESTMENT BRIEF</span>
         <h3>Patient capital.<br />Informed decisions.</h3>
@@ -92,6 +93,7 @@ function App() {
         <h1>{active}</h1></div><div className="header-right"><span className="pill">PAPER MODE</span>
         <button disabled={busy} onClick={() => action(refresh)}>Refresh</button></div></header>
       <div className="risk-banner"><strong>Research tool, not a return forecast.</strong> Losses can exceed 10%. Small-cap inclusion does not imply suitability. Never treat a score as a success probability.</div>
+      {active === 'Excel & charts' && <EvidenceWorkspace />}
       {error && <div role="alert" className="error">{error}</div>}
       {notice && <div role="status" className="notice">{notice}</div>}
       <div className="stats">
@@ -174,6 +176,7 @@ function App() {
         </tbody></table></div>
       </section>}
       {active === 'Methodology' && <section className="panel prose"><span className="eyebrow">TRANSPARENCY OVER CERTAINTY</span><h2>A research checklist. Not a crystal ball.</h2>
+        <p>Excel &amp; charts is a separate, company-name-linked evidence workspace. The XLSX establishes the company; a matching OCR company name suggests the chart link, which you must confirm. Annual and quarterly statement ages are disclosed separately without a blanket 180-day fundamentals blocker. Chart labels do not become verified end-of-day prices. Paper-buy eligibility still follows the original CSV rules below.</p>
         <p>Each condition earns one point: positive 3-year revenue growth, positive 3-year EPS growth, ROE at least 15%, debt/equity at most 1, positive operating cash flow, and positive net profit with cash flow/profit at least 0.8.</p>
         <p>A research candidate needs at least 5/6, price below a dated user-supplied fair value, no reported governance red flag, zero promoter pledge, and average daily traded value of at least INR 1 crore.</p>
         <p>Missing required evidence means insufficient data. A failing condition or stale data means watchlist. Prices older than 7 calendar days and financial periods older than 180 days block candidates. Financial publication and fair-value dates cannot be later than the price date.</p>
